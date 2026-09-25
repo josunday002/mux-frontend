@@ -1,14 +1,27 @@
-# Mux Dashboard
+# Mux Frontend
 
-The developer console for **Mux Protocol** — manage API keys, track wallet creation, and monitor account activity on Stellar.
+Mux Protocol provides invisible wallets and account abstraction on Stellar/Soroban.
+This repository contains the Mux frontend.
 
-Mux Dashboard is the interface for developers building on Mux. It provides visibility into the **Invisible Wallet system** while abstracting away all blockchain complexity.
+## Copy address clipboard UX
 
----
+Copying a wallet address must be reliable and fail-closed: the UI never reports
+success unless the address actually reached the clipboard.
 
-## Overview
+- Use the shared `useCopyAddress` hook (or `copyAddress` helper) instead of
+  calling `navigator.clipboard` directly. It returns a typed result with stable
+error codes so callers can render actionable messages and correlate failures.
+- Stable error codes:
+  - `CLIPBOARD_UNAVAILABLE` — the Clipboard API is missing (insecure context,
+    unsupported browser, or blocked by policy).
+  - `CLIPBOARD_PERMISSION_DENIED` — the user or browser denied clipboard write.
+  - `CLIPBOARD_WRITE_FAILED` — the write was attempted but rejected/failed.
+- On any failure the UI must surface the error and offer a manual-copy fallback
+  (a selectable, read-only address field) rather than silently succeeding.
+- Never log or emit raw address/key material to telemetry; redact addresses in
+  logs and metrics.
 
-Mux Dashboard allows developers to:
+See `docs/security-ux-guards.md` for the broader security/UX guardrails.
 
 * **Create and manage API keys** for SDK access
 * **Track Stellar account creation** on Testnet and Mainnet
@@ -159,3 +172,11 @@ fine whether or not the file exists.
 
 If you prefer, just use `git commit -m "<message>"` — `.git_msg` is never
 required.
+
+---
+
+## References
+
+- `docs/security-ux-guards.md`
+- `tests/e2e/`
+
