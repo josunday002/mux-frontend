@@ -1,54 +1,69 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 /**
- * Activity feed pagination endpoint.
+ * Wallet onboarding endpoint: first key + wallet.
  *
- * Cursor/limit-based pagination for the wallet activity feed with a stable,
- * typed response shape and stable error codes. Deny-by-default authz: the
- * caller must present a valid owner/delegate/guardian/API-key/JWT credential
- * and may only read the feed for a wallet they are authorized on.
+ * Creates the caller's first invisible wallet and provisions its first
+ * signing key. Typed request/response with stable error codes and a
+ * correlation id on every response. Deny-by-default authz: the caller must
+ * present a valid owner/delegate/guardian/API-key/JWT credential and may only
+ * onboard a wallet they are authorized to own. Idempotent on the
+ * `Idempotency-Key` header so concurrent/replayed requests cannot create
+ * duplicate wallets or keys. Fail-closed on upstream (RPC/DB/Horizon) outage.
  */
 
 export const runtime = 'nodejs';
 
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 100;
-
 /** Stable error codes surfaced to clients (never leak internals). */
-export const ActivityFeedErrorCode = {
-  UNAUTHORIZED: 'ACTIVITY_FEED_UNAUTHORIZED',
-  FORBIDDEN: 'ACTIVITY_FEED_FORBIDDEN',
-  INVALID_CURSOR: 'ACTIVITY_FEED_INVALID_CURSOR',
-  INVALID_LIMIT: 'ACTIVITY_FEED_INVALID_LIMIT',
-  UPSTREAM_UNAVAILABLE: 'ACTIVITY_FEED_UPSTREAM_UNAVAILABLE',
-  INTERNAL: 'ACTIVITY_FEED_INTERNAL',
+export const OnboardingErrorCode = {
+  UNAUTHORIZED: 'ONBOARDING_UNAUTHORIZED',
+  FORBIDDEN: 'ONBOARDING_FORBIDDEN',
+  INVALID_REQUEST: 'ONBOARDING_INVALID_REQUEST',
+  IDEMPOTENCY_CONFLICT: 'ONBOARDING_IDEMPOTENCY_CONFLICT',
+  UPSTREAM_UNAVAILABLE: 'ONBOARDING_UPSTREAM_UNAVAILABLE',
+  INTERNAL: 'ONBOARDING_INTERNAL',
 } as const;
 
-export type ActivityFeedErrorCodeValue =
-  (typeof ActivityFeedErrorCode)[keyof typeof ActivityFeedErrorCode];
+export type OnboardingErrorCodeValue =
+  (typeof OnboardingErrorCode)[keyof typeof OnboardingErrorCode];
 
-export type ActivityFeedRole = 'owner' | 'delegate' | 'guardian';
+export type OnboardingRole = 'owner' | 'delegate' | 'guardian';
 
-export interface ActivityFeedItem {
-  id: string;
-  walletId: string;
-  type: string;
+export interface OnboardingRequest {
+  /** Stable client-supplied wallet label; not a secret. */
+  label?: string;
+  /** Optional owner subject; defaults to the authenticated subject. */
+  owner?: string;
+}
+
+export interface OnboardingKey {
+  /** Opaque key id; never the raw key material. */
+  keyId: string;
+  /** Public key only; private material never leaves the signer. */
+  publicKey: string;
+  algorithm: string;
   createdAt: string;
-  /** Redacted, non-sensitive summary only. */
-  summary: string;
 }
 
-export interface ActivityFeedPage {
-  items: ActivityFeedItem[];
-  /** Opaque cursor for the next page, or null when exhausted. */
-  nextCursor: string | null;
-  hasMore: boolean;
-  limit: number;
+export interface OnboardingWallet {
+  walletId: string;
+  owner: string;
+  label: string | null;
+  status: 'active';
+  createdAt: string;
+  firstKey: OnboardingKey;
 }
 
-export interface ActivityFeedErrorBody {
+export interface OnboardingResponse {
+  wallet: OnboardingWallet;
+  /** True when this response replays a prior idempotent request. */
+  replayed: boolean;
+  correlationId: string;
+}
+
+export interface OnboardingErrorBody {
   error: {
-    code: ActivityFeedErrorCodeValue;
+    code: OnboardingErrorCodeValue;
     message: string;
     correlationId: string;
   };
@@ -56,8 +71,9 @@ export interface ActivityFeedErrorBody {
 
 interface AuthContext {
   subject: string;
-  role: ActivityFeedRole;
-  walletIds: string[];
+  role: OnboardingRole;
+  /** Subjects this caller may onboard a wallet for. */
+  ownerScopes: string[];
 }
 
 /**
@@ -75,166 +91,146 @@ async function resolveAuthContext(
   if (!authz && !apiKey) return null;
 
   // Placeholder verification seam. Real implementation validates the JWT
-  // signature/expiry or API-key hash and resolves role + wallet scope.
+  // signature/expiry or API-key hash and resolves role + owner scope.
   const subject = req.headers.get('x-subject');
-  const role = req.headers.get('x-role') as ActivityFeedRole | null;
-  const walletIds = (req.headers.get('x-wallet-ids') ?? '')
+  const role = req.headers.get('x-role') as OnboardingRole | null;
+  const ownerScopes = (req.headers.get('x-owner-scopes') ?? '')
     .split(',')
-    .map((w) => w.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
   if (!subject || !role) return null;
   if (role !== 'owner' && role !== 'delegate' && role !== 'guardian') {
     return null;
   }
-  return { subject, role, walletIds };
+  return { subject, role, ownerScopes };
 }
 
-function isAuthorizedForWallet(
-  auth: AuthContext,
-  walletId: string,
-): boolean {
-  // Deny-by-default: caller must be explicitly scoped to the wallet.
-  return auth.walletIds.includes(walletId);
+function isAuthorizedForOwner(auth: AuthContext, owner: string): boolean {
+  // Deny-by-default: caller must be explicitly scoped to the owner.
+  return auth.ownerScopes.includes(owner);
 }
 
-function encodeCursor(createdAt: string, id: string): string {
-  return Buffer.from(`${createdAt}|${id}`, 'utf8').toString('base64url');
-}
-
-function decodeCursor(
-  cursor: string,
-): { createdAt: string; id: string } | null {
-  try {
-    const raw = Buffer.from(cursor, 'base64url').toString('utf8');
-    const sep = raw.indexOf('|');
-    if (sep <= 0) return null;
-    const createdAt = raw.slice(0, sep);
-    const id = raw.slice(sep + 1);
-    if (!createdAt || !id) return null;
-    if (Number.isNaN(Date.parse(createdAt))) return null;
-    return { createdAt, id };
-  } catch {
-    return null;
+function parseBody(raw: unknown): OnboardingRequest | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const body = raw as Record<string, unknown>;
+  const out: OnboardingRequest = {};
+  if (body.label !== undefined) {
+    if (typeof body.label !== 'string' || body.label.length > 128) return null;
+    out.label = body.label;
   }
-}
-
-function parseLimit(raw: string | null): number | null {
-  if (raw === null) return DEFAULT_LIMIT;
-  if (!/^\d+$/.test(raw)) return null;
-  const n = Number(raw);
-  if (!Number.isSafeInteger(n) || n < 1 || n > MAX_LIMIT) return null;
-  return n;
+  if (body.owner !== undefined) {
+    if (typeof body.owner !== 'string' || body.owner.length === 0) return null;
+    out.owner = body.owner;
+  }
+  return out;
 }
 
 function errorResponse(
-  code: ActivityFeedErrorCodeValue,
+  code: OnboardingErrorCodeValue,
   message: string,
   status: number,
   correlationId: string,
-): NextResponse<ActivityFeedErrorBody> {
+): NextResponse<OnboardingErrorBody> {
   return NextResponse.json(
     { error: { code, message, correlationId } },
-    { status },
+    { status, headers: { 'x-correlation-id': correlationId } },
   );
 }
 
 /**
- * Fetch a page of activity from the source of truth. Fail-closed: any upstream
- * (RPC/DB/Horizon) failure throws so the caller returns a 503 rather than a
- * partial/incorrect page.
+ * Provision the first wallet + key from the source of truth. Fail-closed: any
+ * upstream (RPC/DB/Horizon) failure throws so the caller returns a 503 rather
+ * than a partial/incorrect wallet. Idempotent on (owner, idempotencyKey).
  */
-async function fetchActivityPage(
-  _walletId: string,
-  _limit: number,
-  _cursor: { createdAt: string; id: string } | null,
-): Promise<ActivityFeedItem[]> {
-  // Placeholder data source seam. Real implementation queries the activity
-  // store with a stable (createdAt, id) keyset ordering.
-  return [];
+async function provisionFirstWallet(
+  _owner: string,
+  _label: string | null,
+  _idempotencyKey: string,
+): Promise<{ wallet: OnboardingWallet; replayed: boolean }> {
+  // Placeholder provisioning seam. Real implementation creates the wallet and
+  // its first signing key atomically, keyed by (owner, idempotencyKey) so
+  // concurrent/replayed requests return the same wallet.
+  throw new Error('provisioning not wired');
 }
 
-export async function GET(
+export async function POST(
   req: NextRequest,
-): Promise<NextResponse<ActivityFeedPage | ActivityFeedErrorBody>> {
+): Promise<NextResponse<OnboardingResponse | OnboardingErrorBody>> {
   const correlationId =
     req.headers.get('x-correlation-id') ?? crypto.randomUUID();
 
   const auth = await resolveAuthContext(req);
   if (!auth) {
     return errorResponse(
-      ActivityFeedErrorCode.UNAUTHORIZED,
+      OnboardingErrorCode.UNAUTHORIZED,
       'Authentication required.',
       401,
       correlationId,
     );
   }
 
-  const { searchParams } = new URL(req.url);
-  const walletId = searchParams.get('walletId');
-  if (!walletId) {
+  const idempotencyKey = req.headers.get('idempotency-key');
+  if (!idempotencyKey || idempotencyKey.length > 255) {
     return errorResponse(
-      ActivityFeedErrorCode.FORBIDDEN,
-      'walletId is required.',
+      OnboardingErrorCode.INVALID_REQUEST,
+      'Idempotency-Key header is required.',
       400,
       correlationId,
     );
   }
 
-  if (!isAuthorizedForWallet(auth, walletId)) {
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch {
     return errorResponse(
-      ActivityFeedErrorCode.FORBIDDEN,
-      'Not authorized for this wallet.',
+      OnboardingErrorCode.INVALID_REQUEST,
+      'Request body must be valid JSON.',
+      400,
+      correlationId,
+    );
+  }
+
+  const body = parseBody(raw);
+  if (!body) {
+    return errorResponse(
+      OnboardingErrorCode.INVALID_REQUEST,
+      'Request body is malformed.',
+      400,
+      correlationId,
+    );
+  }
+
+  const owner = body.owner ?? auth.subject;
+  if (!isAuthorizedForOwner(auth, owner)) {
+    return errorResponse(
+      OnboardingErrorCode.FORBIDDEN,
+      'Not authorized to onboard this owner.',
       403,
       correlationId,
     );
   }
 
-  const limit = parseLimit(searchParams.get('limit'));
-  if (limit === null) {
-    return errorResponse(
-      ActivityFeedErrorCode.INVALID_LIMIT,
-      `limit must be an integer between 1 and ${MAX_LIMIT}.`,
-      400,
-      correlationId,
-    );
-  }
-
-  const rawCursor = searchParams.get('cursor');
-  let cursor: { createdAt: string; id: string } | null = null;
-  if (rawCursor !== null) {
-    cursor = decodeCursor(rawCursor);
-    if (!cursor) {
-      return errorResponse(
-        ActivityFeedErrorCode.INVALID_CURSOR,
-        'cursor is malformed.',
-        400,
-        correlationId,
-      );
-    }
-  }
-
-  let items: ActivityFeedItem[];
+  let result: { wallet: OnboardingWallet; replayed: boolean };
   try {
-    items = await fetchActivityPage(walletId, limit, cursor);
+    result = await provisionFirstWallet(
+      owner,
+      body.label ?? null,
+      idempotencyKey,
+    );
   } catch {
-    // Fail-closed: never return a partial page on upstream outage.
+    // Fail-closed: never return a partial wallet on upstream outage.
     return errorResponse(
-      ActivityFeedErrorCode.UPSTREAM_UNAVAILABLE,
-      'Activity source temporarily unavailable.',
+      OnboardingErrorCode.UPSTREAM_UNAVAILABLE,
+      'Wallet provisioning temporarily unavailable.',
       503,
       correlationId,
     );
   }
 
-  const hasMore = items.length > limit;
-  const pageItems = hasMore ? items.slice(0, limit) : items;
-  const last = pageItems[pageItems.length - 1];
-  const nextCursor =
-    hasMore && last ? encodeCursor(last.createdAt, last.id) : null;
-
   return NextResponse.json(
-    { items: pageItems, nextCursor, hasMore, limit },
-    { status: 200, headers: { 'x-correlation-id': correlationId } },
+    { wallet: result.wallet, replayed: result.replayed, correlationId },
+    { status: result.replayed ? 200 : 201, headers: { 'x-correlation-id': correlationId } },
   );
 }

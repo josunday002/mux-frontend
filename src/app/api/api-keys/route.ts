@@ -140,6 +140,17 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   const correlationId = newCorrelationId();
 
+  // Deny-by-default: creating/rotating/revoking keys is a privileged surface.
+  // Require an owner/API-key/JWT credential before any write is considered.
+  if (!isAuthorized(request)) {
+    return errorResponse(
+      401,
+      ERROR_CODES.UNAUTHORIZED,
+      "A valid owner, API key, or JWT credential is required.",
+      correlationId,
+    );
+  }
+
   let body: unknown;
   try {
     body = await request.json();
