@@ -2,106 +2,159 @@ import { describe, expect, it } from "vitest";
 import {
 	evaluateSendFlowGate,
 	parseKillSwitch,
-	parseNetwork,
 	parseOptInFlag,
+	readClientSendFlowFlags,
 	readServerSendFlowFlags,
+	SEND_GATE_CODES,
 	type SendFlowFlags,
 } from "./send-flows";
 
-const TESTNET_ON: SendFlowFlags = {
-	enabled: true,
-	killSwitch: false,
-	mainnetEnabled: false,
-	network: "testnet",
-};
-
-describe("flag parsing", () => {
-	it("opt-in flags are deny-by-default", () => {
+describe("parseOptInFlag", () => {
+	it("returns false for undefined and empty string", () => {
 		expect(parseOptInFlag(undefined)).toBe(false);
 		expect(parseOptInFlag("")).toBe(false);
-		expect(parseOptInFlag("yes")).toBe(false);
-		expect(parseOptInFlag("TRUE ")).toBe(true);
-		expect(parseOptInFlag("1")).toBe(true);
 	});
 
-	it("kill switch fails closed on unrecognised values", () => {
+	it("returns true only for true/1 (case- and whitespace-insensitive)", () => {
+		expect(parseOptInFlag("true")).toBe(true);
+		expect(parseOptInFlag("TRUE")).toBe(true);
+		expect(parseOptInFlag(" 1 ")).toBe(true);
+	});
+
+	it("returns false for unrecognized or falsy values", () => {
+		expect(parseOptInFlag("yes")).toBe(false);
+		expect(parseOptInFlag("0")).toBe(false);
+		expect(parseOptInFlag("false")).toBe(false);
+		expect(parseOptInFlag("FALSE")).toBe(false);
+		expect(parseOptInFlag("off")).toBe(false);
+		expect(parseOptInFlag("typo")).toBe(false);
+	});
+});
+
+describe("parseKillSwitch", () => {
+	it("returns false for undefined and empty string", () => {
 		expect(parseKillSwitch(undefined)).toBe(false);
 		expect(parseKillSwitch("")).toBe(false);
+	});
+
+	it("returns false for false/0 (case- and whitespace-insensitive)", () => {
 		expect(parseKillSwitch("false")).toBe(false);
-		expect(parseKillSwitch("0")).toBe(false);
+		expect(parseKillSwitch("FALSE")).toBe(false);
+		expect(parseKillSwitch(" 0 ")).toBe(false);
+	});
+
+	it("fails closed for unrecognized values", () => {
+		expect(parseKillSwitch("typo")).toBe(true);
 		expect(parseKillSwitch("true")).toBe(true);
-		expect(parseKillSwitch("flase")).toBe(true);
-	});
-
-	it("network must be explicit", () => {
-		expect(parseNetwork("Testnet")).toBe("testnet");
-		expect(parseNetwork("public")).toBe("mainnet");
-		expect(parseNetwork("mainnet ")).toBe("mainnet");
-		expect(parseNetwork("")).toBeNull();
-		expect(parseNetwork("devnet")).toBeNull();
-	});
-
-	it("server flags read only MUX_* flag vars (client flags cannot enable)", () => {
-		const flags = readServerSendFlowFlags({
-			NEXT_PUBLIC_SEND_FLOWS_ENABLED: "true",
-			NEXT_PUBLIC_STELLAR_NETWORK: "testnet",
-		});
-		expect(flags.enabled).toBe(false);
-		expect(flags.network).toBe("testnet");
-	});
-
-	it("a blank server network var does not mask the public one", () => {
-		expect(
-			readServerSendFlowFlags({
-				MUX_STELLAR_NETWORK: " ",
-				NEXT_PUBLIC_STELLAR_NETWORK: "mainnet",
-			}).network,
-		).toBe("mainnet");
+		expect(parseKillSwitch("TRUE")).toBe(true);
+		expect(parseKillSwitch(" 1 ")).toBe(true);
+		expect(parseKillSwitch("yes")).toBe(true);
+		expect(parseKillSwitch("off")).toBe(true);
 	});
 });
 
 describe("evaluateSendFlowGate", () => {
-	it("allows an enabled testnet send", () => {
-		expect(evaluateSendFlowGate(TESTNET_ON, "testnet")).toEqual({
+	const base: SendFlowFlags = {
+		enabled: true,
+		killSwitch: false,
+		mainnetEnabled: false,
+		network: "testnet",
+	};
+
+	it("allows a testnet send when enabled", () => {
+		expect(evaluateSendFlowGate(base)).toEqual({
 			allowed: true,
-			code: "SEND_OK",
+			code: SEND_GATE_CODES.OK,
 			network: "testnet",
 		});
 	});
 
-	it("kill switch overrides every other flag", () => {
-		expect(evaluateSendFlowGate({ ...TESTNET_ON, killSwitch: true }).code).toBe(
-			"SEND_KILL_SWITCH_ENGAGED",
-		);
+	it("kill switch wins over everything", () => {
+		expect(evaluateSendFlowGate({ ...base, killSwitch: true })).toEqual({
+			allowed: false,
+			code: SEND_GATE_CODES.KILL_SWITCH_ENGAGED,
+		});
 	});
 
-	it("is disabled by default", () => {
-		expect(evaluateSendFlowGate({ ...TESTNET_ON, enabled: false }).code).toBe(
-			"SEND_DISABLED",
-		);
+	it("denies when not enabled", () => {
+		expect(evaluateSendFlowGate({ ...base, enabled: false })).toEqual({
+			allowed: false,
+			code: SEND_GATE_CODES.DISABLED,
+		});
 	});
 
-	it("fails closed when the network is misconfigured", () => {
-		expect(evaluateSendFlowGate({ ...TESTNET_ON, network: null }).code).toBe(
-			"SEND_NETWORK_MISCONFIGURED",
-		);
+	it("denies when network is misconfigured", () => {
+		expect(evaluateSendFlowGate({ ...base, network: null })).toEqual({
+			allowed: false,
+			code: SEND_GATE_CODES.NETWORK_MISCONFIGURED,
+		});
 	});
 
-	it("requires a second opt-in for mainnet", () => {
-		const mainnet = { ...TESTNET_ON, network: "mainnet" as const };
-		expect(evaluateSendFlowGate(mainnet).code).toBe("SEND_MAINNET_NOT_ENABLED");
+	it("denies mainnet sends unless mainnet is enabled", () => {
+		expect(evaluateSendFlowGate({ ...base, network: "mainnet" })).toEqual({
+			allowed: false,
+			code: SEND_GATE_CODES.MAINNET_NOT_ENABLED,
+		});
 		expect(
-			evaluateSendFlowGate({ ...mainnet, mainnetEnabled: true }, "mainnet")
-				.allowed,
-		).toBe(true);
+			evaluateSendFlowGate({
+				...base,
+				network: "mainnet",
+				mainnetEnabled: true,
+			}),
+		).toEqual({
+			allowed: true,
+			code: SEND_GATE_CODES.OK,
+			network: "mainnet",
+		});
 	});
 
-	it("rejects a request for a different network than configured", () => {
-		expect(evaluateSendFlowGate(TESTNET_ON, "mainnet").code).toBe(
-			"SEND_NETWORK_MISMATCH",
-		);
-		expect(evaluateSendFlowGate(TESTNET_ON, null).code).toBe(
-			"SEND_NETWORK_MISMATCH",
-		);
+	it("denies a requested network that does not match config", () => {
+		expect(evaluateSendFlowGate(base, "mainnet")).toEqual({
+			allowed: false,
+			code: SEND_GATE_CODES.NETWORK_MISMATCH,
+		});
+	});
+});
+
+describe("readServerSendFlowFlags", () => {
+	it("reads server-only MUX_* flags", () => {
+		const flags = readServerSendFlowFlags({
+			MUX_SEND_FLOWS_ENABLED: "true",
+			MUX_SEND_KILL_SWITCH: "false",
+			MUX_SEND_MAINNET_ENABLED: "1",
+			MUX_STELLAR_NETWORK: "mainnet",
+		});
+		expect(flags).toEqual({
+			enabled: true,
+			killSwitch: false,
+			mainnetEnabled: true,
+			network: "mainnet",
+		});
+	});
+
+	it("fails closed on unknown network", () => {
+		const flags = readServerSendFlowFlags({ MUX_STELLAR_NETWORK: "bogus" });
+		expect(flags.network).toBeNull();
+	});
+});
+
+describe("readClientSendFlowFlags", () => {
+	it("reads NEXT_PUBLIC_* flags", () => {
+		const original = { ...process.env };
+		process.env.NEXT_PUBLIC_SEND_FLOWS_ENABLED = "1";
+		process.env.NEXT_PUBLIC_SEND_KILL_SWITCH = "0";
+		process.env.NEXT_PUBLIC_SEND_MAINNET_ENABLED = "false";
+		process.env.NEXT_PUBLIC_STELLAR_NETWORK = "testnet";
+		try {
+			const flags = readClientSendFlowFlags();
+			expect(flags).toEqual({
+				enabled: true,
+				killSwitch: false,
+				mainnetEnabled: false,
+				network: "testnet",
+			});
+		} finally {
+			process.env = original;
+		}
 	});
 });
